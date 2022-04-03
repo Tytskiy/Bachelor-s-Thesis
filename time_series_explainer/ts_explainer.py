@@ -329,8 +329,6 @@ def evaluate_explanation(
 ):
     Nth_quantile = np.quantile(np.array([x[1] for x in explanations]), quantile)
     pos_explanations = set([x[0] for x in explanations if x[1] >= Nth_quantile])
-    print(Nth_quantile)
-    print(pos_explanations)
     idxs_split = indexes_split(ts_instance.shape[1], num_slices)
     new_instance = ts_instance.copy()
     for j, (s, e) in enumerate(idxs_split):
@@ -350,9 +348,10 @@ def evaluate_explanation(
                 low=ts_instance.min(axis=1)[:, None],
                 high=ts_instance.max(axis=1)[:, None],
                 size=ts_instance[:, s:e].shape)
-        elif replacement_method == "dataset" and data is not None:
-            k = randint(0, len(data)-1)
-            new_instance[:, s:e] = data[k][:, s:e]
+        elif replacement_method == "swap":
+            new_instance[:, s:e] = 1 - new_instance[:, s:e]
+        elif replacement_method == "reverse":
+            new_instance[:, s:e] = new_instance[:, e-1:s-1:-1]
         else:
             raise ValueError("Incorrect replacement_method (and maybe data is None)")
     diff = predict_fn(ts_instance) - predict_fn(new_instance)
