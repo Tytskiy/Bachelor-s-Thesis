@@ -1,4 +1,3 @@
-from tokenize import Intnumber
 from typing import Iterable, List, Optional, Union, Tuple, Any, Callable
 import numpy as np
 from sklearn.metrics import pairwise_distances
@@ -30,13 +29,13 @@ def indexes_split(n: int, num_slices: int):
 
 
 def generate_sythetic_data(
-    ts_instance: np.array,
+    ts_instance: np.ndarray,
     predict_fn: Callable,
     num_slices: int,
     num_samples: Union[int, None],
     metric: str = "jaccard",
     replacement_method: str = "random",
-    data: Optional[np.array] = None,
+    data: Optional[np.ndarray] = None,
     gen_with_replacement=False,
 ) -> Tuple:
     if ts_instance.shape[1] <= num_slices:
@@ -50,11 +49,12 @@ def generate_sythetic_data(
 
     if num_slices < 63 and not gen_with_replacement:
         # random.sample support range from 0 to 2**63 - 1
-        _rng = np.array([2**num_slices - 1] + sample(range(2**num_slices-1), num_samples-1))
+        _rng = np.array([2**num_slices - 1, 0] + sample(range(1, 2**num_slices-1), num_samples-2))
         bin_samples = (((_rng[:, None] & (1 << np.arange(num_slices-1, -1, -1)))) > 0).astype(int)
     else:
         bin_samples = np.random.binomial(1, p=0.5, size=(num_samples, num_slices))
         bin_samples[0] = 1  # first vector must match with source object
+        bin_samples[1] = 0
 
     idxs_split = indexes_split(ts_instance.shape[1], num_slices)
 
@@ -69,7 +69,7 @@ def generate_sythetic_data(
             if bin_samples[i, j] == 1:
                 continue
             if replacement_method == "dataset_mean" and data is not None:
-                disabled_ts[:, s:e] = data[:, :, s:e].mean()
+                disabled_ts[:, s:e] = data[:, :, s:e].mean(axis=(0, 2))[:, None]
             elif replacement_method == "zeros":
                 disabled_ts[:, s:e] = 0
             elif replacement_method == "normal_random":
@@ -86,25 +86,25 @@ def generate_sythetic_data(
                 k = randint(0, len(data)-1)
                 disabled_ts[:, s:e] = data[k][:, s:e]
             else:
-                raise ValueError
+                raise ValueError("Incorrect replacement_method (and maybe data is None)")
 
         new_ts = np.where(expanded_bin_samples, ts_instance, disabled_ts)
         samples.append(new_ts[None, :, :])
 
     samples = np.concatenate(samples, axis=0)
-
     targets = predict_fn(samples)
+    fi_0 = targets[1].copy()  # its need for shap
     with warnings.catch_warnings():
         warnings.filterwarnings(action='ignore', category=DataConversionWarning)
         distances = pairwise_distances(bin_samples[0][None, :], bin_samples, metric=metric).ravel()
-    return bin_samples, targets, distances
+    return bin_samples, targets, distances, fi_0
 
 
 class LimeTimeSeriesExplainer:
 
     def __init__(
         self,
-        predict_fn,
+        predict_fn: Callable,
         num_features: Optional[int] = 1,
         class_names: Optional[List[str]] = None,
         metric: str = "jaccard",
@@ -141,7 +141,7 @@ class LimeTimeSeriesExplainer:
         labels: Optional[List[Any]] = None,
         top_labels: Optional[int] = None
     ):
-        X, preds, distances = generate_sythetic_data(
+        X, preds, distances, _ = generate_sythetic_data(
             ts_instance, self.predict_fn, num_slices, num_samples, self.metric, self.replacement_method)
 
         if self.class_names is None:
@@ -176,11 +176,10 @@ class LimeTimeSeriesExplainer:
 
 
 class ShapTimeSeriesExplainer:
-
     def __init__(
         self,
         predict_fn,
-        data: np.array,
+        data: np.ndarray,
         class_names: Optional[List[str]] = None,
         replacement_method="mean"
     ):
@@ -190,30 +189,28 @@ class ShapTimeSeriesExplainer:
         def metric(x, y):
             M = int(x.sum())
             N = int(y.sum())
-            if N == 0:
-                N = 1
-            elif N == M:
-                N -= 1
+            if N == 0 or N == M:
+                return 10**6
             return (M - 1)/(comb(M, N) * (M - N)*N)
 
         self.metric = metric
         self.replacement_method = replacement_method
         self.class_names = class_names
-        self.model_regressor = Ridge(alpha=0, fit_intercept=True)
+        self.model_regressor = Ridge(alpha=0, fit_intercept=False)
         self.base = lime_base.LimeBase(lambda x: x)
 
     def explain_instance(
         self,
-        ts_instance: np.array,
+        ts_instance: np.ndarray,
         num_slices: int,
         num_samples: int,
         num_features: int,
         labels: Optional[List[Any]] = None,
         top_labels: Optional[int] = None
     ):
-        X, preds, distances = generate_sythetic_data(
+        X, preds, distances, fi_0 = generate_sythetic_data(
             ts_instance, self.predict_fn, num_slices, num_samples, self.metric, self.replacement_method, self.data)
-
+        preds -= fi_0  # its reason why we don't fit intercept
         if self.class_names is None:
             self.class_names = [str(x) for x in range(preds.shape[1])]
 
@@ -243,11 +240,12 @@ class ShapTimeSeriesExplainer:
                 feature_selection="highest_weights",
 
             )
+            ret_exp.intercept[l] = fi_0[l]
         return ret_exp
 
 
 def plot_eeg(
-    X: np.array,
+    X: np.ndarray,
     num_slices: int,
     exp_like_alpha: List[Tuple[int, float]],
     features_name: Optional[List[str]] = None,
@@ -293,7 +291,7 @@ def plot_eeg(
 
 
 def cumulative_explanation(
-        X: np.array,
+        X: np.ndarray,
         label: int,
         explainer_functor: Callable,
         slices_range: Iterable[int] = np.arange(2, 21)
@@ -318,3 +316,44 @@ def cumulative_explanation(
         start, end = idxs_split[i]
         list_explanations.append((i, cumulative_exp[start:end].mean()))
     return list_explanations, cumulative_exp
+
+
+def evaluate_explanation(
+    ts_instance: np.ndarray,
+    predict_fn: Callable,
+    explanations: List[Tuple[int, float]],
+    num_slices: int,
+    replacement_method: str = "random",
+    quantile: float = 0.9,
+    data: Optional[np.ndarray] = None
+):
+    Nth_quantile = np.quantile(np.array([x[1] for x in explanations]), quantile)
+    pos_explanations = set([x[0] for x in explanations if x[1] >= Nth_quantile])
+    print(Nth_quantile)
+    print(pos_explanations)
+    idxs_split = indexes_split(ts_instance.shape[1], num_slices)
+    new_instance = ts_instance.copy()
+    for j, (s, e) in enumerate(idxs_split):
+        if j not in pos_explanations:
+            continue
+        if replacement_method == "dataset_mean" and data is not None:
+            new_instance[:, s:e] = data[:, :, s:e].mean(axis=(0, 2))[:, None]
+        elif replacement_method == "zeros":
+            new_instance[:, s:e] = 0
+        elif replacement_method == "normal_random":
+            new_instance[:, s:e] = np.random.normal(
+                loc=ts_instance.mean(axis=1)[:, None],
+                scale=ts_instance.scale(axis=1)[:, None],
+                size=ts_instance[:, s:e].shape)
+        elif replacement_method == "random":
+            new_instance[:, s:e] = np.random.uniform(
+                low=ts_instance.min(axis=1)[:, None],
+                high=ts_instance.max(axis=1)[:, None],
+                size=ts_instance[:, s:e].shape)
+        elif replacement_method == "dataset" and data is not None:
+            k = randint(0, len(data)-1)
+            new_instance[:, s:e] = data[k][:, s:e]
+        else:
+            raise ValueError("Incorrect replacement_method (and maybe data is None)")
+    diff = predict_fn(ts_instance) - predict_fn(new_instance)
+    return diff
