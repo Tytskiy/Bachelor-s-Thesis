@@ -59,6 +59,12 @@ def generate_sythetic_data(
     idxs_split = indexes_split(ts_instance.shape[1], num_slices)
 
     samples = []
+
+    if replacement_method == "dataset_mean" and data is not None:
+        mean_ts = np.empty_like(ts_instance)
+        for j, (s, e) in enumerate(idxs_split):
+            mean_ts[:, s:e] = data[:, :, s:e].mean(axis=(0, 2))[:, None]
+
     for i in range(num_samples):
         expanded_bin_samples = np.empty_like(ts_instance)
         for j, (s, e) in enumerate(idxs_split):
@@ -69,7 +75,7 @@ def generate_sythetic_data(
             if bin_samples[i, j] == 1:
                 continue
             if replacement_method == "dataset_mean" and data is not None:
-                disabled_ts[:, s:e] = data[:, :, s:e].mean(axis=(0, 2))[:, None]
+                disabled_ts[:, s:e] = mean_ts[:, s:e]
             elif replacement_method == "zeros":
                 disabled_ts[:, s:e] = 0
             elif replacement_method == "normal_random":
@@ -105,24 +111,24 @@ class LimeTimeSeriesExplainer:
     def __init__(
         self,
         predict_fn: Callable,
-        num_features: Optional[int] = 1,
         class_names: Optional[List[str]] = None,
         metric: str = "jaccard",
+        data: Optional[np.ndarray] = None,
         replacement_method: str = "random",
         model_regressor=None,
         kernel: Optional[Callable] = None,
-        kernel_width: Optional[float] = None,
+        kernel_width: Optional[float] = 1,
         feature_selection='auto'
     ):
         self.predict_fn = predict_fn
         self.metric = metric
+        self.data = data
         self.replacement_method = replacement_method
         self.class_names = class_names
         self.model_regressor = model_regressor
         self.feature_selection = feature_selection
 
-        if kernel_width is None:
-            kernel_width = np.sqrt(num_features) * 0.75
+        # kernel_width = np.sqrt(kernel_num_features) * 0.75
         kernel_width = float(kernel_width)
 
         if kernel is None:
@@ -142,7 +148,7 @@ class LimeTimeSeriesExplainer:
         top_labels: Optional[int] = None
     ):
         X, preds, distances, _ = generate_sythetic_data(
-            ts_instance, self.predict_fn, num_slices, num_samples, self.metric, self.replacement_method)
+            ts_instance, self.predict_fn, num_slices, num_samples, self.metric, self.replacement_method, self.data)
 
         if self.class_names is None:
             self.class_names = [str(x) for x in range(preds.shape[1])]
@@ -178,10 +184,10 @@ class LimeTimeSeriesExplainer:
 class ShapTimeSeriesExplainer:
     def __init__(
         self,
-        predict_fn,
-        data: np.ndarray,
+        predict_fn: Callable,
         class_names: Optional[List[str]] = None,
-        replacement_method="mean"
+        data: Optional[np.ndarray] = None,
+        replacement_method: str = "random"
     ):
         self.predict_fn = predict_fn
         self.data = data
@@ -246,8 +252,8 @@ class ShapTimeSeriesExplainer:
 
 def plot_eeg(
     X: np.ndarray,
-    num_slices: int,
-    exp_like_alpha: List[Tuple[int, float]],
+    exp_like_alpha: Optional[List[Tuple[int, float]]] = None,
+    num_slices: int = 10,
     features_name: Optional[List[str]] = None,
     title: str = "",
     figsize: Tuple[int, int] = (10, 7),
@@ -260,7 +266,7 @@ def plot_eeg(
     fig = plt.figure(figsize=figsize)
     gs = fig.add_gridspec(X.shape[0], hspace=0)
     axes = gs.subplots(sharex=True, sharey=False)
-    if not isinstance(axes, list):
+    if X.shape[0] == 1:
         axes = [axes]
 
     fig.suptitle(title)
@@ -280,12 +286,13 @@ def plot_eeg(
     axes[0].spines['top'].set_visible(True)
     axes[-1].spines['bottom'].set_visible(True)
 
-    idxs_split = indexes_split(X.shape[1], num_slices)
-    for feature, weight in exp_like_alpha:
-        start, end = idxs_split[feature]
-        color = negative_color if weight < 0 else positive_color
-        for ax in axes:
-            ax.axvspan(start, end, color=color, alpha=abs(weight))
+    if exp_like_alpha is not None:
+        idxs_split = indexes_split(X.shape[1], num_slices)
+        for feature, weight in exp_like_alpha:
+            start, end = idxs_split[feature]
+            color = negative_color if weight < 0 else positive_color
+            for ax in axes:
+                ax.axvspan(start, end, color=color, alpha=abs(weight))
 
     return fig, axes
 
@@ -320,39 +327,61 @@ def cumulative_explanation(
 
 def evaluate_explanation(
     ts_instance: np.ndarray,
-    predict_fn: Callable,
     explanations: List[Tuple[int, float]],
     num_slices: int,
+    data: Optional[np.ndarray] = None,
     replacement_method: str = "random",
     quantile: float = 0.9,
-    data: Optional[np.ndarray] = None
 ):
     Nth_quantile = np.quantile(np.array([x[1] for x in explanations]), quantile)
     pos_explanations = set([x[0] for x in explanations if x[1] >= Nth_quantile])
     idxs_split = indexes_split(ts_instance.shape[1], num_slices)
     new_instance = ts_instance.copy()
+
+    cherry_pick_slice = []
     for j, (s, e) in enumerate(idxs_split):
         if j not in pos_explanations:
             continue
-        if replacement_method == "dataset_mean" and data is not None:
-            new_instance[:, s:e] = data[:, :, s:e].mean(axis=(0, 2))[:, None]
-        elif replacement_method == "zeros":
-            new_instance[:, s:e] = 0
-        elif replacement_method == "normal_random":
-            new_instance[:, s:e] = np.random.normal(
+        cherry_pick_slice.append([ts_instance[:, s:e].copy(), (s, e)])
+
+    if replacement_method == "dataset_mean" and data is not None:
+        for slice in cherry_pick_slice:
+            s, e = slice[1]
+            slice[0] = data[:, :, s:e].mean(0)
+    elif replacement_method == "zeros":
+        for slice in cherry_pick_slice:
+            slice[0][:, :] = 0
+    elif replacement_method == "normal_random":
+        for slice in cherry_pick_slice:
+            s, e = slice[1]
+            slice[0] = np.random.normal(
                 loc=ts_instance.mean(axis=1)[:, None],
                 scale=ts_instance.scale(axis=1)[:, None],
                 size=ts_instance[:, s:e].shape)
-        elif replacement_method == "random":
-            new_instance[:, s:e] = np.random.uniform(
+    elif replacement_method == "random":
+        for slice in cherry_pick_slice:
+            s, e = slice[1]
+            slice[0] = np.random.uniform(
                 low=ts_instance.min(axis=1)[:, None],
                 high=ts_instance.max(axis=1)[:, None],
                 size=ts_instance[:, s:e].shape)
-        elif replacement_method == "swap":
-            new_instance[:, s:e] = 1 - new_instance[:, s:e]
-        elif replacement_method == "reverse":
-            new_instance[:, s:e] = new_instance[:, e-1:s-1:-1]
-        else:
-            raise ValueError("Incorrect replacement_method (and maybe data is None)")
-    diff = predict_fn(ts_instance) - predict_fn(new_instance)
-    return diff
+    elif replacement_method == "reverse" and data is not None:
+        for slice in cherry_pick_slice:
+            s, e = slice[1]
+            slice[0] = data[:, :, s:e].max(0) - slice[0]
+    elif replacement_method == "swap":
+        se = [slice[1] for slice in cherry_pick_slice]
+        cherry_pick_slice = cherry_pick_slice[::-1]
+        cherry_pick_slice = [(cherry_pick_slice[i][0], se[i]) for i in range(len(cherry_pick_slice))]
+
+    elif replacement_method == "mean":
+        for slice in cherry_pick_slice:
+            slice[0][:, :] = slice[0].mean()
+    else:
+        raise ValueError("Incorrect replacement_method (and maybe data is None)")
+
+    for slice, (s, e) in cherry_pick_slice:
+        d = min(e - s, slice.shape[1])
+        new_instance[:, s: s + d] = slice[:, :d]
+
+    return new_instance
